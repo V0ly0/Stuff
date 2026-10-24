@@ -600,6 +600,8 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
     <div id="more-wrap">
       <button class="ib" data-action="more" aria-label="More options" aria-haspopup="true"><span data-i="dots"></span></button>
       <div class="menu" id="more-menu" role="menu">
+        <button data-action="sync-settings" role="menuitem"><span data-i="devices"></span>Sync across devices</button>
+        <hr>
         <button data-action="export" role="menuitem"><span data-i="download"></span>Export workspace</button>
         <button data-action="csv" role="menuitem"><span data-i="list"></span>Export setup (CSV)</button>
         <button data-action="import" role="menuitem"><span data-i="upload"></span>Import workspace</button>
@@ -611,7 +613,7 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
   </div>
 </header>
 <main id="screen" tabindex="-1"></main>
-<footer class="page-foot"><span>Data stays in this browser. Export it from the menu to back it up.</span></footer>
+<footer class="page-foot"><span id="data-footnote">Data stays in this browser until cloud sync is connected. Export a backup from the menu.</span></footer>
 
 <div class="drawer-scrim" id="drawer-scrim" data-action="drawer-close"></div>
 <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="d-title" aria-hidden="true">
@@ -623,6 +625,7 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
 <div id="modal-root"></div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <input type="file" id="import-file" accept="application/json,.json" hidden>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (() => {
   'use strict';
@@ -726,6 +729,12 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
   let state;
   try { const raw = localStorage.getItem(KEY); state = raw ? normalize(JSON.parse(raw)) : seedState(); } catch (e) { state = seedState(); }
   if (!SORTS.includes(state.sort)) state.sort = 'manual';
+
+  const CLOUD_CONFIG_KEY = 'stuff-cloud-config-v1';
+  let cloudConfig = (() => { try { return JSON.parse(localStorage.getItem(CLOUD_CONFIG_KEY) || '{"url":"","key":""}') || {url:'',key:''}; } catch { return {url:'',key:''}; } })();
+  let cloudClient = null, cloudUser = null, cloudChannel = null, cloudReady = false;
+  let cloudLoadPromise = null, cloudLoadingUserId = '', cloudSaveTimer = null, cloudWriteQueue = Promise.resolve();
+  let cloudUpdatedAt = '', cloudPendingTimestamp = '', cloudApplying = false, cloudLocalEditAt = 0;
   let activeView = 'builder', query = '', category = 'All', toastTimer = null, lastFocus = null, drawerFocus = null, printMode = false;
   let invFilter = 'all', invCat = 'All', libSort = 'default', itemQ = '', flashId = null;
 
@@ -748,10 +757,179 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
     return m;
   }
 
-  function save(){
-    try { localStorage.setItem(KEY, JSON.stringify(state)); const t=new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); $('#saved').innerHTML = '<span class="dot pulse"></span><span class="st">Saved · '+t+'</span>'; }
-    catch (e) { $('#saved').innerHTML = '<span class="dot" style="opacity:.3"></span><span class="st">Not saved</span>'; toast('Storage unavailable. Export your workspace to keep your data.'); }
+  function setSavedStatus(label, active=true){
+    const el = $('#saved'); if (!el) return;
+    el.innerHTML = `<span class="dot ${active?'pulse':''}" style="${active?'':'opacity:.3'}"></span><span class="st">${esc(label)}</span>`;
   }
+  function save(){
+    try {
+      localStorage.setItem(KEY, JSON.stringify(state));
+      if (cloudUser && cloudReady && !cloudApplying) { cloudLocalEditAt = Date.now(); setSavedStatus('Sync pending'); queueCloudSave(); }
+      else setSavedStatus('Saved locally');
+    } catch (e) { setSavedStatus('Not saved', false); toast('Storage unavailable. Export your workspace to keep your data.'); }
+  }
+  function cloudRedirectUrl(){ return window.location.origin + window.location.pathname; }
+  function validCloudConfig(url, key){
+    try { const u = new URL(url); return u.protocol === 'https:' && !!u.hostname && key.trim().length > 20; } catch { return false; }
+  }
+  function storeCloudConfig(url, key){
+    cloudConfig = {url:url.replace(/\/+$/, ''), key:key.trim()};
+    localStorage.setItem(CLOUD_CONFIG_KEY, JSON.stringify(cloudConfig));
+  }
+  function stopCloudChannel(){
+    if (cloudChannel && cloudClient) { try { cloudClient.removeChannel(cloudChannel); } catch {} }
+    cloudChannel = null;
+  }
+  function updateFootnote(){
+    const el = $('#data-footnote');
+    if (el) el.textContent = cloudUser && cloudReady ? 'Cloud sync is connected. Use the same email account on your other devices.' : 'Data stays in this browser until cloud sync is connected. Export a backup from the menu.';
+  }
+  function resetCloudAccount(){
+    stopCloudChannel(); cloudUser = null; cloudReady = false; cloudLoadingUserId = ''; cloudLoadPromise = null;
+    clearTimeout(cloudSaveTimer); cloudSaveTimer = null; cloudPendingTimestamp = '';
+    setSavedStatus('Saved locally'); updateFootnote();
+  }
+  function createCloudClient(force=false){
+    if (!cloudConfig.url || !cloudConfig.key) throw new Error('Enter your Supabase Project URL and publishable/anon key.');
+    if (!window.supabase || typeof window.supabase.createClient !== 'function') throw new Error('The Supabase library could not load. Check your connection and reload the page.');
+    if (cloudClient && !force) return cloudClient;
+    stopCloudChannel(); cloudClient = window.supabase.createClient(cloudConfig.url, cloudConfig.key, {auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+    cloudClient.auth.onAuthStateChange((event, session) => {
+      setTimeout(() => {
+        if (session && session.user) activateCloudUser(session.user);
+        else if (event === 'SIGNED_OUT') resetCloudAccount();
+      }, 0);
+    });
+    cloudClient.auth.getSession().then(({data, error}) => {
+      if (error) { setSavedStatus('Cloud login error', false); return; }
+      if (data && data.session && data.session.user) activateCloudUser(data.session.user);
+    }).catch(() => setSavedStatus('Cloud unavailable', false));
+    return cloudClient;
+  }
+  async function pushCloudSnapshot(snapshot, editAt=cloudLocalEditAt, quiet=false){
+    if (!cloudClient || !cloudUser) return;
+    const userId = cloudUser.id, timestamp = new Date().toISOString();
+    cloudPendingTimestamp = timestamp;
+    const {error} = await cloudClient.from('stuff_workspaces').upsert({user_id:userId, state:snapshot, updated_at:timestamp}, {onConflict:'user_id'});
+    cloudPendingTimestamp = '';
+    if (error) throw error;
+    if (cloudUser && cloudUser.id === userId) {
+      if (!cloudUpdatedAt || Date.parse(timestamp) >= Date.parse(cloudUpdatedAt)) cloudUpdatedAt = timestamp;
+      if (editAt === cloudLocalEditAt && !cloudSaveTimer) setSavedStatus('Synced · ' + new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
+      updateFootnote();
+    }
+  }
+  function queueCloudSave(){
+    if (!cloudUser || !cloudReady || cloudApplying) return;
+    clearTimeout(cloudSaveTimer);
+    setSavedStatus('Sync pending');
+    cloudSaveTimer = setTimeout(() => {
+      cloudSaveTimer = null;
+      const snapshot = JSON.parse(JSON.stringify(state)), editAt = cloudLocalEditAt;
+      cloudWriteQueue = cloudWriteQueue.catch(() => {}).then(() => pushCloudSnapshot(snapshot, editAt)).catch(err => {
+        if (cloudUser) setSavedStatus('Sync failed · saved locally', false);
+        console.error('STUFF cloud sync failed:', err);
+      });
+    }, 550);
+  }
+  function applyCloudState(remoteState, updatedAt, announce=false){
+    clearTimeout(cloudSaveTimer); cloudSaveTimer = null; cloudPendingTimestamp = '';
+    try {
+      state = normalize(remoteState);
+      if (!SORTS.includes(state.sort)) state.sort = 'manual';
+      localStorage.setItem(KEY, JSON.stringify(state));
+      cloudUpdatedAt = updatedAt || cloudUpdatedAt; cloudLocalEditAt = Date.now();
+      cloudApplying = true; render(); cloudApplying = false;
+      setSavedStatus('Synced'); updateFootnote();
+      if (announce) toast('Workspace updated from another device.');
+    } catch (err) {
+      cloudApplying = false;
+      setSavedStatus('Cloud data error', false);
+      toast('Could not load the cloud workspace. Export your local data before continuing.');
+      console.error('STUFF cloud state invalid:', err);
+    }
+  }
+  function subscribeCloud(userId){
+    stopCloudChannel();
+    cloudChannel = cloudClient.channel('stuff-workspace-' + userId)
+      .on('postgres_changes', {event:'*', schema:'public', table:'stuff_workspaces', filter:'user_id=eq.' + userId}, payload => {
+        const row = payload && payload.new;
+        if (!row || row.user_id !== userId || !row.state) return;
+        const incomingTime = Date.parse(row.updated_at || '');
+        const knownTime = Math.max(Date.parse(cloudUpdatedAt || '1970-01-01T00:00:00Z') || 0, Date.parse(cloudPendingTimestamp || '1970-01-01T00:00:00Z') || 0);
+        if (!Number.isFinite(incomingTime) || incomingTime <= knownTime) return;
+        if (cloudSaveTimer) {
+          if (incomingTime <= cloudLocalEditAt) return;
+          clearTimeout(cloudSaveTimer); cloudSaveTimer = null;
+        }
+        applyCloudState(row.state, row.updated_at, true);
+      })
+      .subscribe(status => {
+        if (status === 'SUBSCRIBED' && cloudUser && cloudReady) setSavedStatus('Sync connected');
+        else if ((status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') && cloudUser) setSavedStatus('Sync reconnecting', false);
+      });
+  }
+  async function activateCloudUser(user){
+    if (!cloudClient || !user) return;
+    if (cloudUser && cloudUser.id === user.id && cloudReady) return;
+    if (cloudLoadingUserId === user.id && cloudLoadPromise) return cloudLoadPromise;
+    cloudLoadingUserId = user.id; cloudUser = user; cloudReady = false;
+    setSavedStatus('Loading cloud…'); updateFootnote();
+    cloudLoadPromise = (async () => {
+      const {data, error} = await cloudClient.from('stuff_workspaces').select('state,updated_at').eq('user_id', user.id).maybeSingle();
+      if (error) throw error;
+      if (data && data.state) {
+        applyCloudState(data.state, data.updated_at, false);
+        cloudReady = true;
+        subscribeCloud(user.id);
+      } else {
+        cloudReady = true;
+        await pushCloudSnapshot(JSON.parse(JSON.stringify(state)), cloudLocalEditAt, true);
+        subscribeCloud(user.id);
+      }
+      updateFootnote();
+      toast('Cloud sync connected.');
+    })();
+    try { await cloudLoadPromise; }
+    catch (err) {
+      cloudReady = false;
+      setSavedStatus('Cloud setup error', false);
+      toast('Cloud sync failed. Check the table, RLS policies and Supabase keys in SYNC_SETUP.md.');
+      console.error('STUFF cloud setup failed:', err);
+    } finally { if (cloudLoadingUserId === user.id) { cloudLoadingUserId = ''; cloudLoadPromise = null; } }
+  }
+  async function sendCloudLogin(url, key, email){
+    if (!validCloudConfig(url, key)) { toast('Enter a valid HTTPS Supabase URL and a public publishable/anon key.'); return; }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { toast('Enter a valid email address.'); return; }
+    try {
+      storeCloudConfig(url, key);
+      createCloudClient(true);
+      const {error} = await cloudClient.auth.signInWithOtp({email, options:{emailRedirectTo:cloudRedirectUrl()}});
+      if (error) throw error;
+      closeModal();
+      toast('Login link sent. Open the email on this device to connect it.');
+    } catch (err) {
+      toast(err && err.message ? err.message : 'Could not send the login link. Check your Supabase settings.');
+      console.error('STUFF magic-link error:', err);
+    }
+  }
+  function openSyncSettings(forceSetup=false){
+    closeMenu();
+    if (!forceSetup && cloudUser && cloudReady) {
+      openModal({title:'Sync across devices', sub:'Connected as ' + (cloudUser.email || 'your account'), body:`<div class="note-box"><strong>Cloud sync is on.</strong><br>Your setups, product library, prices, theme and preferences are saved to your Supabase workspace and shared with devices signed into this same email account. Changes sync automatically; keep this page online while they upload.</div><div class="srow"><div><strong>Sync status</strong><small id="sync-status-detail">Connected · automatic sync enabled</small></div><span class="tag">Cloud</span></div><p class="fine">If two devices change the same data at almost the same time, the most recent saved workspace can replace the other change. Export a backup before major changes.</p>`, submit:'Sync now', extra:`<button type="button" class="btn" data-action="cloud-reconfigure">Change connection</button><button type="button" class="btn" data-action="cloud-signout">Sign out</button>`, onSubmit:async () => { try { await pushCloudSnapshot(JSON.parse(JSON.stringify(state)), cloudLocalEditAt); closeModal(); toast('Workspace synced.'); } catch(err) { setSavedStatus('Sync failed · saved locally', false); toast('Sync failed. Check your Supabase connection.'); console.error(err); } }});
+      return;
+    }
+    openModal({title:'Sync across devices', sub:'Connect a private cloud workspace', body:`<div class="note-box">Create a free Supabase project and run the SQL from <a href="SYNC_SETUP.md" target="_blank" rel="noopener">SYNC_SETUP.md</a>. Then enter its Project URL and public publishable/anon key below. <strong>Never use a service_role or secret key.</strong> The first device initializes the cloud workspace; other devices signed into the same email load that workspace.</div><div class="form">${field('cloud-url','Supabase Project URL',cloudConfig.url,'url','s2','required placeholder="https://your-project.supabase.co" autocomplete="url"')}${field('cloud-key','Publishable / anon key',cloudConfig.key,'text','s2','required autocomplete="off" spellcheck="false"')}${field('cloud-email','Email address','','email','s2','required autocomplete="email" placeholder="you@example.com"')}</div><p class="fine">A sign-in link will be sent by email. Open it on every device you want to sync. Each browser needs these project settings once. Your workspace remains stored locally if cloud sync is not connected.</p>`, submit:'Send login link', onSubmit:async f => { await sendCloudLogin(String(f.get('cloud-url')||'').trim(), String(f.get('cloud-key')||'').trim(), String(f.get('cloud-email')||'').trim()); }});
+  }
+  async function signOutCloud(){
+    try { if (cloudClient) await cloudClient.auth.signOut(); } catch (err) { console.error(err); }
+    resetCloudAccount(); closeModal(); toast('Cloud sync disconnected. Your local copy is unchanged.');
+  }
+  function initializeCloud(){
+    if (!cloudConfig.url || !cloudConfig.key) { updateFootnote(); return; }
+    try { createCloudClient(); } catch (err) { setSavedStatus('Cloud unavailable', false); console.error(err); }
+  }
+
   function toast(msg){const el=$('#toast');el.classList.remove('has-act');el.textContent=msg;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),2800);}
 
   const CUTKEY = 'stuff-cuts-v2', cutCache = new Map();
@@ -1997,7 +2175,7 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
     confirmBox('Replace workspace?', 'Importing replaces your current setups and personal products.', `${inc.kits.length} setups · ${inc.products.length} personal products. Export your current workspace first if you want a backup.`, 'Import workspace', () => { state = inc; query = ''; category = 'All'; invFilter = 'all'; invCat = 'All'; activeView = 'builder'; save(); closeModal(); render(); toast('Workspace imported.'); });
   }
   function showHelp(){
-    openModal({title:'How it works', sub:'', body:`<div class="srow"><div><strong>Setups</strong><small>One list per use: travel, desk, daily carry. No limit on setups, products or quantities.</small></div></div><div class="srow"><div><strong>Products</strong><small>Pick from the library or paste a store link: name, brand, price and image are fetched when the site allows it. Everything stays editable. The first background removal downloads an AI model of about 80 MB, cached afterwards.</small></div></div><div class="srow"><div><strong>Owned or wishlist</strong><small>Owned items count as value, wishlist items count as what is left to buy.</small></div></div><div class="srow"><div><strong>Prices</strong><small>In EUR. Fetched prices are not converted from other currencies. Items without a price are left out of totals. Shipping is not included.</small></div></div><div class="srow"><div><strong>Your data</strong><small>Everything stays in this browser. Export a JSON file to back it up or move it.</small></div></div><div class="pills"><span class="pill">/ search</span><span class="pill">N new product</span><span class="pill">L list or grid</span><span class="pill">T theme</span><span class="pill">Esc close</span><span class="pill">Ctrl/⌘ Z undo</span></div>`});
+    openModal({title:'How it works', sub:'', body:`<div class="srow"><div><strong>Setups</strong><small>One list per use: travel, desk, daily carry. No limit on setups, products or quantities.</small></div></div><div class="srow"><div><strong>Products</strong><small>Pick from the library or paste a store link: name, brand, price and image are fetched when the site allows it. Everything stays editable. The first background removal downloads an AI model of about 80 MB, cached afterwards.</small></div></div><div class="srow"><div><strong>Owned or wishlist</strong><small>Owned items count as value, wishlist items count as what is left to buy.</small></div></div><div class="srow"><div><strong>Prices</strong><small>In EUR. Fetched prices are not converted from other currencies. Items without a price are left out of totals. Shipping is not included.</small></div></div><div class="srow"><div><strong>Your data</strong><small>Everything stays in this browser until cloud sync is connected. Use Sync across devices in the menu to connect a Supabase workspace; export a JSON backup before moving data.</small></div></div><div class="pills"><span class="pill">/ search</span><span class="pill">N new product</span><span class="pill">L list or grid</span><span class="pill">T theme</span><span class="pill">Esc close</span><span class="pill">Ctrl/⌘ Z undo</span></div>`});
   }
   function printSetup(){
     if (activeView !== 'builder') return;
@@ -2048,6 +2226,9 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
       case 'export': closeMenu(); exportData(); break;
       case 'csv': closeMenu(); exportCSV(); break;
       case 'import': closeMenu(); $('#import-file').click(); break;
+      case 'sync-settings': openSyncSettings(); break;
+      case 'cloud-signout': signOutCloud(); break;
+      case 'cloud-reconfigure': { const reopen = () => openSyncSettings(true); if (cloudClient) cloudClient.auth.signOut().finally(() => { resetCloudAccount(); reopen(); }); else reopen(); break; }
       case 'print': printSetup(); break;
       case 'theme': state.theme = state.theme==='light' ? 'dark' : 'light'; save(); document.documentElement.dataset.theme = state.theme; renderChrome(); break;
       case 'help': closeMenu(); showHelp(); break;
@@ -2115,6 +2296,7 @@ body .enter .tile.flash .tile-img,body .enter .row.flash{animation:flash 1.2s va
   $('#dchips').innerHTML = chipsHTML();
   hydrate();
   render();
+  initializeCloud();
   setTimeout(() => { migrateImages(); cutSeeds(); }, 600); window.addEventListener('resize', renderChrome); if (document.fonts && document.fonts.ready) document.fonts.ready.then(renderChrome);
 })();
 </script>
